@@ -3,6 +3,7 @@ package sysfs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -224,5 +225,45 @@ func TestEnsureWokenCachesFDAcrossCalls(t *testing.T) {
 	}
 	if got := len(r.wakeFD); got != 0 {
 		t.Errorf("Close should drain wakeFD, got %d entries", got)
+	}
+}
+
+func TestEnsureWokenPinsRuntimePMAndCloseRestores(t *testing.T) {
+	// Synthesise a card whose power/control file we can read+write.
+	// ensureWoken should write "on", remember the previous value,
+	// and Close() should restore it.
+	root := t.TempDir()
+	cardName := "card0"
+	device := filepath.Join(root, cardName, "device")
+	powerDir := filepath.Join(device, "power")
+	if err := os.MkdirAll(powerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctrlPath := filepath.Join(powerDir, "control")
+	if err := os.WriteFile(ctrlPath, []byte("auto\n"), 0o644); err != nil { //nolint:gosec
+		t.Fatal(err)
+	}
+
+	r := NewWithDRI(root, t.TempDir(), t.TempDir())
+	c := Card{Name: cardName, DevicePath: device}
+	r.ensureWoken(c)
+
+	got, _ := os.ReadFile(ctrlPath)
+	if strings.TrimSpace(string(got)) != "on" {
+		t.Errorf("after ensureWoken, power/control = %q, want %q", string(got), "on")
+	}
+	if r.pinned[cardName] != "auto" {
+		t.Errorf("pinned cache = %q, want %q", r.pinned[cardName], "auto")
+	}
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	got, _ = os.ReadFile(ctrlPath)
+	if strings.TrimSpace(string(got)) != "auto" {
+		t.Errorf("after Close, power/control = %q, want %q (restored)", string(got), "auto")
+	}
+	if len(r.pinned) != 0 {
+		t.Errorf("Close should drain pinned cache, got %d entries", len(r.pinned))
 	}
 }

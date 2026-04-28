@@ -94,12 +94,15 @@ func main() {
 		logger.Warn("both backends disabled — exporter will emit no GPU metrics")
 	}
 
+	sysfsReader := sysfs.New(cfg.SysfsRoot, cfg.ProcRoot)
+	defer func() { _ = sysfsReader.Close() }()
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		collectors.NewGoCollector(),
 		exporter.NewCollector(cfg,
-			sysfs.New(cfg.SysfsRoot, cfg.ProcRoot),
+			sysfsReader,
 			amdsmi.New(cfg.AmdSMIPath, cfg.AmdSMITimeout),
 			logger,
 		),

@@ -29,16 +29,31 @@ const (
 )
 
 // Reader is the entrypoint into the sysfs backend. It is safe for
-// concurrent use; sysfs values are not cached across scrapes
-// (sysfs reads are cheap and we want each /metrics call to reflect
-// current state). The Reader does cache one piece of state: a long-
-// lived DRM render-node fd per discovered card, opened on first
-// ReadCard call. Holding the fd open keeps AMDGPU runtime PM
-// resumed for the lifetime of the exporter — closing the fd would
-// cause the GPU to re-suspend after a few seconds idle, and the
-// next scrape would catch the resume initialization burst (gpu_busy
-// reads ~50-70% for a moment, sclk ramps to ~1500 MHz, power spikes
-// to ~70 W) which looks like a workload but is just firmware init.
+// concurrent use; sysfs values are not cached across scrapes (sysfs
+// reads are cheap and we want each /metrics call to reflect current
+// state).
+//
+// The Reader caches two pieces of state per discovered card so the
+// AMDGPU driver doesn't suspend the GPU between scrapes — that
+// re-suspend would cause every cold scrape to catch a resume
+// initialization burst (gpu_busy reads ~50-70 %, sclk ramps to
+// ~1500 MHz, power spikes to ~70 W — none of that is real workload):
+//
+//  1. A long-lived DRM render-node fd, opened on first ReadCard. The
+//     open establishes a DRM client context so /proc/<pid>/fdinfo of
+//     the exporter shows up correctly when the per-process collector
+//     walks fdinfo.
+//  2. The card's runtime-PM control file is forced to "on", which
+//     disables the kernel's auto-suspend timer for the device.
+//     Holding the DRM fd alone is NOT enough: AMDGPU's drm_open()
+//     calls pm_runtime_get_sync() then immediately
+//     pm_runtime_put_autosuspend(), so without further activity the
+//     GPU re-suspends ~5 s later. Forcing power/control=on is the
+//     stable way to keep the GPU runtime-active for the exporter's
+//     lifetime.
+//
+// Close() restores power/control to "auto" and releases the fd so
+// the kernel can resume normal power management on shutdown.
 type Reader struct {
 	root     string
 	procRoot string
@@ -46,6 +61,7 @@ type Reader struct {
 
 	mu     sync.Mutex
 	wakeFD map[string]*os.File // keyed by Card.Name
+	pinned map[string]string   // card.Name → previous power/control value
 }
 
 // New returns a Reader rooted at the given paths. Pass DefaultRoot /
@@ -62,6 +78,7 @@ func New(root, procRoot string) *Reader {
 		procRoot: procRoot,
 		driRoot:  "/dev/dri",
 		wakeFD:   map[string]*os.File{},
+		pinned:   map[string]string{},
 	}
 }
 
@@ -74,15 +91,27 @@ func NewWithDRI(root, procRoot, driRoot string) *Reader {
 	return r
 }
 
-// Close releases any cached wake fds. The exporter typically only
-// ever calls this on shutdown.
+// Close releases any cached wake fds and restores each card's
+// runtime-PM control file to its previous value (typically "auto"
+// — the kernel default). The exporter typically only ever calls
+// this on shutdown.
 func (r *Reader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	for cardName, prev := range r.pinned {
+		path := filepath.Join(r.root, cardName, "device", "power", "control")
+		if err := os.WriteFile(path, []byte(prev), 0o644); err != nil { //nolint:gosec
+			// Best-effort; log nothing here, the call site
+			// (cmd/.../main.go) only invokes Close() during signal
+			// shutdown when nothing is listening anyway.
+			_ = err
+		}
+	}
 	for _, f := range r.wakeFD {
 		_ = f.Close()
 	}
 	r.wakeFD = map[string]*os.File{}
+	r.pinned = map[string]string{}
 	return nil
 }
 
@@ -246,17 +275,8 @@ type VoltageRail struct {
 
 // ReadCard runs every sysfs read needed for one card.
 func (r *Reader) ReadCard(c Card) CardSnapshot {
-	// AMDGPU runtime power management suspends the GPU when no DRM
-	// client has it open. While suspended, dynamic sysfs reads
-	// (gpu_busy_percent, temp*_input, pp_dpm_*, hwmon/*) return EPERM
-	// and a few "static" fields (current_link_width, current_link_speed)
-	// return bogus values. We open a DRM render-node fd on first
-	// scrape and hold it for the exporter's lifetime — opening per-
-	// scrape would let the GPU re-suspend between scrapes and every
-	// scrape would catch the resume initialization burst (gpu_busy
-	// transiently reads ~50-70%, sclk ramps to ~1500 MHz, power
-	// spikes to ~70 W) which looks like a workload but is just
-	// firmware init.
+	// Make sure the card is runtime-PM-active before we read. See
+	// ensureWoken / Reader's struct docs for the why and how.
 	r.ensureWoken(c)
 
 	snap := CardSnapshot{
@@ -294,37 +314,70 @@ func (r *Reader) ReadCard(c Card) CardSnapshot {
 
 // ----- runtime PM wake -----------------------------------------------------
 
-// ensureWoken makes sure the card's DRM render node fd is open and
-// cached on the Reader, so AMDGPU runtime PM keeps the GPU resumed
-// for the lifetime of the exporter. No-op if the fd is already
-// cached. Best-effort: failures (no /dev/dri/renderD<n> available,
-// permission denied) leave the cache empty and the rest of the
-// reader keeps working — sysfs reads may return EPERM in that
-// case, which the per-field readers already tolerate.
+// ensureWoken keeps the card runtime-PM-active for the exporter's
+// lifetime so dynamic sysfs reads don't return EPERM and the kernel
+// doesn't catch us mid-resume each scrape (which would inflate
+// gpu_busy_percent / sclk / power readings).
 //
-// On first open this polls runtime_status briefly so the caller
-// doesn't race the suspend → active transition (50–300 ms on
-// RDNA3). On subsequent scrapes the fd is already open and we
-// short-circuit straight back to the caller.
+// Two things are cached on first ReadCard:
+//
+//  1. /dev/dri/renderD<n> opened RDONLY — establishes a DRM client
+//     context so the exporter shows up cleanly in fdinfo and so per-
+//     process collection can attribute its own state.
+//  2. /sys/.../power/control written "on" — disables the kernel's
+//     auto-suspend timer. (Holding the DRM fd alone is insufficient:
+//     AMDGPU's drm_open() bumps the runtime-PM ref then immediately
+//     pm_runtime_put_autosuspend()s it, so without further DRM
+//     activity the GPU re-suspends ~5 s later.) The previous value
+//     is remembered so Close() can restore it.
+//
+// Both are best-effort: if /dev/dri is empty, /sys is read-only, or
+// the kernel rejects either operation, ensureWoken returns and the
+// reader keeps working — dynamic sysfs reads may then return EPERM
+// (which the per-field readers already tolerate).
 func (r *Reader) ensureWoken(c Card) {
 	r.mu.Lock()
-	if _, ok := r.wakeFD[c.Name]; ok {
-		r.mu.Unlock()
-		return
-	}
+	_, hasFD := r.wakeFD[c.Name]
+	_, hasPin := r.pinned[c.Name]
 	r.mu.Unlock()
-
-	renderPath := r.findRenderNode(c)
-	if renderPath == "" {
-		return
-	}
-	f, err := os.OpenFile(renderPath, os.O_RDONLY, 0)
-	if err != nil {
+	if hasFD && hasPin {
 		return
 	}
 
-	// Wait out the resume-from-suspended transition. Bound at 500 ms
-	// so a wedged card doesn't tank the first scrape's latency.
+	// 1) Open the render node fd (cheap; fast wake during the open path)
+	if !hasFD {
+		if renderPath := r.findRenderNode(c); renderPath != "" {
+			if f, err := os.OpenFile(renderPath, os.O_RDONLY, 0); err == nil {
+				r.mu.Lock()
+				if _, ok := r.wakeFD[c.Name]; ok {
+					_ = f.Close() // lost the race
+				} else {
+					r.wakeFD[c.Name] = f
+				}
+				r.mu.Unlock()
+			}
+		}
+	}
+
+	// 2) Pin runtime-PM by writing "on" to power/control. Read the
+	// previous value first so Close() can put it back.
+	if !hasPin {
+		ctrlPath := filepath.Join(c.DevicePath, "power", "control")
+		prev, err := readText(ctrlPath)
+		if err == nil {
+			if werr := os.WriteFile(ctrlPath, []byte("on\n"), 0o644); werr == nil { //nolint:gosec
+				r.mu.Lock()
+				if _, ok := r.pinned[c.Name]; !ok {
+					r.pinned[c.Name] = prev
+				}
+				r.mu.Unlock()
+			}
+		}
+	}
+
+	// Wait out the resume-from-suspended transition (50–300 ms on
+	// RDNA3). Bound at 500 ms so a wedged card doesn't tank the
+	// first scrape's latency.
 	rsPath := filepath.Join(c.DevicePath, "power", "runtime_status")
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for {
@@ -337,16 +390,6 @@ func (r *Reader) ensureWoken(c Card) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-
-	r.mu.Lock()
-	if existing, ok := r.wakeFD[c.Name]; ok {
-		// Lost the race against another goroutine; close the dup.
-		_ = f.Close()
-		_ = existing
-	} else {
-		r.wakeFD[c.Name] = f
-	}
-	r.mu.Unlock()
 }
 
 // findRenderNode returns the /dev/dri/renderD<minor> path that
