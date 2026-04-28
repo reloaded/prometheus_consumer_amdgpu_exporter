@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -32,6 +33,7 @@ const (
 type Reader struct {
 	root     string
 	procRoot string
+	driRoot  string
 }
 
 // New returns a Reader rooted at the given paths. Pass DefaultRoot /
@@ -43,7 +45,16 @@ func New(root, procRoot string) *Reader {
 	if procRoot == "" {
 		procRoot = DefaultProc
 	}
-	return &Reader{root: root, procRoot: procRoot}
+	return &Reader{root: root, procRoot: procRoot, driRoot: "/dev/dri"}
+}
+
+// NewWithDRI is like New but lets tests point /dev/dri at a tempdir.
+func NewWithDRI(root, procRoot, driRoot string) *Reader {
+	r := New(root, procRoot)
+	if driRoot != "" {
+		r.driRoot = driRoot
+	}
+	return r
 }
 
 // Card describes one discovered AMD GPU.
@@ -206,6 +217,16 @@ type VoltageRail struct {
 
 // ReadCard runs every sysfs read needed for one card.
 func (r *Reader) ReadCard(c Card) CardSnapshot {
+	// AMDGPU runtime power management suspends the GPU when no DRM
+	// client has it open. While suspended, dynamic sysfs reads
+	// (gpu_busy_percent, temp*_input, pp_dpm_*, hwmon/*) return EPERM
+	// and a few "static" fields (current_link_width, current_link_speed)
+	// return bogus values. Open a render node fd before reading and
+	// hold it for the scrape — the AMD driver pm_runtime_get_sync's on
+	// the open and stays active as long as the fd is live.
+	closer := r.wakeGPU(c)
+	defer closer()
+
 	snap := CardSnapshot{
 		Card:     c,
 		Identity: r.ReadIdentity(c),
@@ -237,6 +258,79 @@ func (r *Reader) ReadCard(c Card) CardSnapshot {
 		snap.Hwmon = readHwmon(c.HwmonPath)
 	}
 	return snap
+}
+
+// ----- runtime PM wake -----------------------------------------------------
+
+// wakeGPU opens the card's DRM render node (/dev/dri/renderD<minor>) so
+// AMDGPU runtime PM resumes the GPU. Returns a no-op closer when the
+// node can't be opened (best-effort — sysfs reads will then likely
+// return EPERM, which the rest of the reader already tolerates).
+//
+// After opening the fd this polls runtime_status briefly until it shows
+// "active" so the caller doesn't race the resume transition.
+func (r *Reader) wakeGPU(c Card) (closer func()) {
+	noop := func() {}
+	renderPath := r.findRenderNode(c)
+	if renderPath == "" {
+		return noop
+	}
+	f, err := os.OpenFile(renderPath, os.O_RDONLY, 0)
+	if err != nil {
+		return noop
+	}
+
+	// Poll runtime_status — the resume from suspended takes ~50-300ms
+	// on RDNA3. Bound at 500ms so a wedged card doesn't tank scrape
+	// latency. If runtime_status doesn't exist (older kernel / non-AMD)
+	// fall through after the first iteration.
+	rsPath := filepath.Join(c.DevicePath, "power", "runtime_status")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		rs, err := readText(rsPath)
+		if err != nil || rs == "active" || rs == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return func() { _ = f.Close() }
+}
+
+// findRenderNode returns the /dev/dri/renderD<minor> path that
+// corresponds to this card. It reads <device>/drm/renderD<N> if
+// available (the kernel publishes the render minor as a sibling DRM
+// minor under the device); falls back to /dev/dri/renderD128.
+func (r *Reader) findRenderNode(c Card) string {
+	drmDir := filepath.Join(c.DevicePath, "drm")
+	if entries, err := os.ReadDir(drmDir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, "renderD") {
+				return filepath.Join(r.driRoot, name)
+			}
+		}
+	}
+	// Linux convention: render minor = card minor + 128. cardN -> renderD(128+N).
+	if n := cardSuffix(c.Name); n >= 0 {
+		return filepath.Join(r.driRoot, fmt.Sprintf("renderD%d", 128+n))
+	}
+	return ""
+}
+
+// cardSuffix returns the integer N from "cardN", or -1 on no match.
+func cardSuffix(name string) int {
+	if !strings.HasPrefix(name, "card") {
+		return -1
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(name, "card"))
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 // ----- DPM clock parsing ---------------------------------------------------
