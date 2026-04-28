@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,12 +29,23 @@ const (
 )
 
 // Reader is the entrypoint into the sysfs backend. It is safe for
-// concurrent use; nothing is cached across scrapes (sysfs reads are
-// cheap and we want each /metrics call to reflect the current state).
+// concurrent use; sysfs values are not cached across scrapes
+// (sysfs reads are cheap and we want each /metrics call to reflect
+// current state). The Reader does cache one piece of state: a long-
+// lived DRM render-node fd per discovered card, opened on first
+// ReadCard call. Holding the fd open keeps AMDGPU runtime PM
+// resumed for the lifetime of the exporter — closing the fd would
+// cause the GPU to re-suspend after a few seconds idle, and the
+// next scrape would catch the resume initialization burst (gpu_busy
+// reads ~50-70% for a moment, sclk ramps to ~1500 MHz, power spikes
+// to ~70 W) which looks like a workload but is just firmware init.
 type Reader struct {
 	root     string
 	procRoot string
 	driRoot  string
+
+	mu     sync.Mutex
+	wakeFD map[string]*os.File // keyed by Card.Name
 }
 
 // New returns a Reader rooted at the given paths. Pass DefaultRoot /
@@ -45,7 +57,12 @@ func New(root, procRoot string) *Reader {
 	if procRoot == "" {
 		procRoot = DefaultProc
 	}
-	return &Reader{root: root, procRoot: procRoot, driRoot: "/dev/dri"}
+	return &Reader{
+		root:     root,
+		procRoot: procRoot,
+		driRoot:  "/dev/dri",
+		wakeFD:   map[string]*os.File{},
+	}
 }
 
 // NewWithDRI is like New but lets tests point /dev/dri at a tempdir.
@@ -55,6 +72,18 @@ func NewWithDRI(root, procRoot, driRoot string) *Reader {
 		r.driRoot = driRoot
 	}
 	return r
+}
+
+// Close releases any cached wake fds. The exporter typically only
+// ever calls this on shutdown.
+func (r *Reader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, f := range r.wakeFD {
+		_ = f.Close()
+	}
+	r.wakeFD = map[string]*os.File{}
+	return nil
 }
 
 // Card describes one discovered AMD GPU.
@@ -221,11 +250,14 @@ func (r *Reader) ReadCard(c Card) CardSnapshot {
 	// client has it open. While suspended, dynamic sysfs reads
 	// (gpu_busy_percent, temp*_input, pp_dpm_*, hwmon/*) return EPERM
 	// and a few "static" fields (current_link_width, current_link_speed)
-	// return bogus values. Open a render node fd before reading and
-	// hold it for the scrape — the AMD driver pm_runtime_get_sync's on
-	// the open and stays active as long as the fd is live.
-	closer := r.wakeGPU(c)
-	defer closer()
+	// return bogus values. We open a DRM render-node fd on first
+	// scrape and hold it for the exporter's lifetime — opening per-
+	// scrape would let the GPU re-suspend between scrapes and every
+	// scrape would catch the resume initialization burst (gpu_busy
+	// transiently reads ~50-70%, sclk ramps to ~1500 MHz, power
+	// spikes to ~70 W) which looks like a workload but is just
+	// firmware init.
+	r.ensureWoken(c)
 
 	snap := CardSnapshot{
 		Card:     c,
@@ -262,28 +294,37 @@ func (r *Reader) ReadCard(c Card) CardSnapshot {
 
 // ----- runtime PM wake -----------------------------------------------------
 
-// wakeGPU opens the card's DRM render node (/dev/dri/renderD<minor>) so
-// AMDGPU runtime PM resumes the GPU. Returns a no-op closer when the
-// node can't be opened (best-effort — sysfs reads will then likely
-// return EPERM, which the rest of the reader already tolerates).
+// ensureWoken makes sure the card's DRM render node fd is open and
+// cached on the Reader, so AMDGPU runtime PM keeps the GPU resumed
+// for the lifetime of the exporter. No-op if the fd is already
+// cached. Best-effort: failures (no /dev/dri/renderD<n> available,
+// permission denied) leave the cache empty and the rest of the
+// reader keeps working — sysfs reads may return EPERM in that
+// case, which the per-field readers already tolerate.
 //
-// After opening the fd this polls runtime_status briefly until it shows
-// "active" so the caller doesn't race the resume transition.
-func (r *Reader) wakeGPU(c Card) (closer func()) {
-	noop := func() {}
+// On first open this polls runtime_status briefly so the caller
+// doesn't race the suspend → active transition (50–300 ms on
+// RDNA3). On subsequent scrapes the fd is already open and we
+// short-circuit straight back to the caller.
+func (r *Reader) ensureWoken(c Card) {
+	r.mu.Lock()
+	if _, ok := r.wakeFD[c.Name]; ok {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+
 	renderPath := r.findRenderNode(c)
 	if renderPath == "" {
-		return noop
+		return
 	}
 	f, err := os.OpenFile(renderPath, os.O_RDONLY, 0)
 	if err != nil {
-		return noop
+		return
 	}
 
-	// Poll runtime_status — the resume from suspended takes ~50-300ms
-	// on RDNA3. Bound at 500ms so a wedged card doesn't tank scrape
-	// latency. If runtime_status doesn't exist (older kernel / non-AMD)
-	// fall through after the first iteration.
+	// Wait out the resume-from-suspended transition. Bound at 500 ms
+	// so a wedged card doesn't tank the first scrape's latency.
 	rsPath := filepath.Join(c.DevicePath, "power", "runtime_status")
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for {
@@ -297,7 +338,15 @@ func (r *Reader) wakeGPU(c Card) (closer func()) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	return func() { _ = f.Close() }
+	r.mu.Lock()
+	if existing, ok := r.wakeFD[c.Name]; ok {
+		// Lost the race against another goroutine; close the dup.
+		_ = f.Close()
+		_ = existing
+	} else {
+		r.wakeFD[c.Name] = f
+	}
+	r.mu.Unlock()
 }
 
 // findRenderNode returns the /dev/dri/renderD<minor> path that
