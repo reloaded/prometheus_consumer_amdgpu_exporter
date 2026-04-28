@@ -190,11 +190,39 @@ func TestFindRenderNodeFallsBackToCardNumber(t *testing.T) {
 	}
 }
 
-func TestWakeGPUNoOpWhenRenderNodeMissing(t *testing.T) {
-	// Point driRoot at an empty dir; wakeGPU should silently no-op,
+func TestEnsureWokenNoOpWhenRenderNodeMissing(t *testing.T) {
+	// Point driRoot at an empty dir; ensureWoken should silently no-op,
 	// not crash, when the render device file doesn't exist.
 	dri := t.TempDir()
 	r := NewWithDRI(t.TempDir(), t.TempDir(), dri)
-	closer := r.wakeGPU(Card{Name: "card7", DevicePath: filepath.Join(t.TempDir(), "card7")})
-	closer() // must be safe to call even when wake didn't open anything
+	r.ensureWoken(Card{Name: "card7", DevicePath: filepath.Join(t.TempDir(), "card7")})
+	if got := len(r.wakeFD); got != 0 {
+		t.Errorf("wakeFD should stay empty when render node is missing, got %d entries", got)
+	}
+	if err := r.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestEnsureWokenCachesFDAcrossCalls(t *testing.T) {
+	// Provide a real render node file; ensureWoken should open it
+	// once and reuse the cached fd on subsequent calls.
+	dri := t.TempDir()
+	renderFile := filepath.Join(dri, "renderD128")
+	if err := os.WriteFile(renderFile, []byte{}, 0o644); err != nil { //nolint:gosec
+		t.Fatal(err)
+	}
+	r := NewWithDRI(t.TempDir(), t.TempDir(), dri)
+	c := Card{Name: "card0", DevicePath: filepath.Join(t.TempDir(), "card0")}
+	r.ensureWoken(c)
+	r.ensureWoken(c) // second call — should be a no-op
+	if got := len(r.wakeFD); got != 1 {
+		t.Errorf("wakeFD should hold 1 entry, got %d", got)
+	}
+	if err := r.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if got := len(r.wakeFD); got != 0 {
+		t.Errorf("Close should drain wakeFD, got %d entries", got)
+	}
 }
