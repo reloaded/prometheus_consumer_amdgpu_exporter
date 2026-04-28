@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve modules
+        env:
+          GOFLAGS: -mod=mod
+        run: go mod download
+
+      - name: gofmt -s
+        run: |
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then
+            echo "::error::gofmt -s found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61.0
+
+      - name: go test
+        run: go test -race -cover ./...
+
+  build:
+    name: Build (linux/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve modules
+        env:
+          GOFLAGS: -mod=mod
+        run: go mod download
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::7}" \
+            -o /tmp/prometheus_consumer_amdgpu_exporter-${{ matrix.arch }} \
+            ./cmd/prometheus_consumer_amdgpu_exporter
+
+  docker-build:
+    name: Docker build (PR)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            VERSION=pr-${{ github.event.pull_request.number }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.pull_request.updated_at }}
+
+  smoke:
+    # Build the local image, run it, scrape /metrics. The runner has
+    # no AMD GPU, so amdgpu_nodes_total is 0 — but the family must
+    # exist with a sample, which catches import / handler regressions.
+    name: Smoke (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t prometheus_consumer_amdgpu_exporter:ci .
+      - name: Run + scrape
+        run: |
+          docker run -d --rm --name e2e \
+            -e CONSUMER_AMDGPU_EXPORTER_BACKEND_AMD_SMI=false \
+            -p 9504:9504 \
+            prometheus_consumer_amdgpu_exporter:ci
+          for _ in 1 2 3 4 5; do
+            sleep 1
+            if curl -fsS http://127.0.0.1:9504/metrics > metrics.txt; then break; fi
+          done
+          test -s metrics.txt
+          grep -q '^amdgpu_nodes_total' metrics.txt
+          docker stop e2e

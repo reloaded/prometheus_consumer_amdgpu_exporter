@@ -1,0 +1,37 @@
+# golangci-lint config.
+# https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - bodyclose
+    - errorlint
+    - gosec
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/reloaded/prometheus_consumer_amdgpu_exporter
+  gosec:
+    excludes:
+      - G104  # ignored Write/Close in HTTP handlers
+      - G204  # subprocess via operator-controlled binary path
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
