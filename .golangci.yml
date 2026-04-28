@@ -1,37 +1,45 @@
-# golangci-lint config.
+# golangci-lint v2 config.
 # https://golangci-lint.run/usage/configuration/
+version: "2"
 
 run:
   timeout: 5m
 
 linters:
-  disable-all: true
+  default: none
   enable:
-    - errcheck
-    - gosimple
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    - gofmt
-    - goimports
-    - misspell
-    - revive
     - bodyclose
+    - errcheck
     - errorlint
     - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck    # gosimple was folded into staticcheck in v2
+    - unused
+  settings:
+    gosec:
+      excludes:
+        # http.ResponseWriter writes intentionally don't check the error.
+        - G104
+        # subprocess via operator-controlled binary path (amd-smi).
+        - G204
+        # Reading the operator-supplied -config / sysfs paths.
+        - G304
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
 
-linters-settings:
-  goimports:
-    local-prefixes: github.com/reloaded/prometheus_consumer_amdgpu_exporter
-  gosec:
-    excludes:
-      - G104  # ignored Write/Close in HTTP handlers
-      - G204  # subprocess via operator-controlled binary path
-
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - gosec
-        - errcheck
+# In v2, gofmt and goimports are formatters (not linters).
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/reloaded/prometheus_consumer_amdgpu_exporter

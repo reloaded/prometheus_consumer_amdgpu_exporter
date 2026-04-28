@@ -8,15 +8,6 @@ on:
 permissions:
   contents: read
 
-# golangci-lint-action stays on v6 because v7+ requires
-# golangci-lint v2.x (a separate config-migration task). v6 is
-# declared as node20, so opt it onto node24 ahead of GitHub's
-# 2026-06-02 forced-flip / 2026-09-16 node20 removal. Has no
-# effect on the other actions in this workflow — they're already
-# on node24-native majors.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -51,9 +42,9 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.61.0
+          version: v2.3.0
 
       - name: go test
         run: go test -race -cover ./...
