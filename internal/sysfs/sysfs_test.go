@@ -163,3 +163,38 @@ func TestDiscoverEmptyRoot(t *testing.T) {
 		t.Errorf("got %d cards, want 0", len(cards))
 	}
 }
+
+func TestFindRenderNodePrefersSysfsLink(t *testing.T) {
+	root := t.TempDir()
+	dri := t.TempDir()
+	device := filepath.Join(root, "card3", "device")
+	if err := os.MkdirAll(filepath.Join(device, "drm", "renderD131"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := NewWithDRI(root, t.TempDir(), dri)
+	got := r.findRenderNode(Card{Name: "card3", DevicePath: device})
+	want := filepath.Join(dri, "renderD131")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestFindRenderNodeFallsBackToCardNumber(t *testing.T) {
+	dri := t.TempDir()
+	r := NewWithDRI(t.TempDir(), t.TempDir(), dri)
+	// Card with no drm/ subdirectory: fall back to renderD(128+N).
+	got := r.findRenderNode(Card{Name: "card2", DevicePath: filepath.Join(t.TempDir(), "no-drm-dir")})
+	want := filepath.Join(dri, "renderD130")
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestWakeGPUNoOpWhenRenderNodeMissing(t *testing.T) {
+	// Point driRoot at an empty dir; wakeGPU should silently no-op,
+	// not crash, when the render device file doesn't exist.
+	dri := t.TempDir()
+	r := NewWithDRI(t.TempDir(), t.TempDir(), dri)
+	closer := r.wakeGPU(Card{Name: "card7", DevicePath: filepath.Join(t.TempDir(), "card7")})
+	closer() // must be safe to call even when wake didn't open anything
+}
