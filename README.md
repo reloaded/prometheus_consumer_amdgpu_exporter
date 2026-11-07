@@ -182,8 +182,8 @@ populate on `amdgpu_info`.
 
 ## Grafana dashboard
 
-The companion dashboard lives at
-[`reloaded/grafana-dashboards/consumer_amdgpu_exporter`](https://github.com/reloaded/grafana-dashboards/tree/main/consumer_amdgpu_exporter).
+The companion Grafana dashboard ships with the Ansible role that deploys
+this exporter, not with this repo.
 
 ## License
 
